@@ -41,9 +41,15 @@
     "watch:esbuild": "node esbuild.js --watch",
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
     "vscode:prepublish": "npm run package",
-    "package": "npm run check-types && node esbuild.js --production"
+    "package": "npm run check-types && node esbuild.js --production",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "test:ci": "jest --coverage --ci --reporters=default --reporters=jest-junit"
   },
   "devDependencies": {
+    "@jest/globals": "^30.0.4",
+    "@types/jest": "^30.0.0",
     "@types/jimp": "^0.2.1",
     "@types/node": "^18",
     "@types/vscode": "^1.73.0",
@@ -52,7 +58,10 @@
     "@typescript-eslint/parser": "^7.14.0",
     "esbuild": "^0.25.0",
     "eslint": "^8.26.0",
+    "jest": "^30.0.4",
+    "jest-junit": "^16.0.0",
     "npm-run-all": "^4.1.5",
+    "ts-jest": "^29.4.0",
     "typescript": "^5.5.2"
   },
   "dependencies": {

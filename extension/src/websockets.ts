@@ -22,6 +22,15 @@ interface VNCQualitySettings {
   fps: number;
 }
 
+interface ResolutionProfile {
+  name: string;
+  minWidth: number;
+  defaultWidth: number;
+  jpegQuality: number;
+  fps: number;
+  maxFrameSize: number; // in KB, for chunking threshold
+}
+
 /**
  * Manages screen capture for all connected clients.
  * Features frame coalescing and adaptive quality settings.
@@ -31,12 +40,25 @@ class ScreenCaptureManager {
   private isCapturing = false;
   private captureInterval: NodeJS.Timeout | null = null;
 
-  // Base configuration with better defaults
-  private quality: VNCQualitySettings = {
-    width: 1440,        // Default width for good quality
-    jpegQuality: 85,    // Start with good quality
-    fps: 45,           // Target FPS
-  };
+  // Resolution profiles for different display types
+  private readonly RESOLUTION_PROFILES: ResolutionProfile[] = [
+    // Ultra high resolution (8K+)
+    { name: "8K+", minWidth: 7680, defaultWidth: 960, jpegQuality: 70, fps: 20, maxFrameSize: 512 },
+    // 5K/6K displays  
+    { name: "5K-6K", minWidth: 5120, defaultWidth: 1024, jpegQuality: 75, fps: 25, maxFrameSize: 768 },
+    // 4K displays
+    { name: "4K", minWidth: 3840, defaultWidth: 1200, jpegQuality: 80, fps: 30, maxFrameSize: 1024 },
+    // Ultrawide QHD (3440x1440)
+    { name: "Ultrawide", minWidth: 3440, defaultWidth: 1280, jpegQuality: 82, fps: 35, maxFrameSize: 1024 },
+    // Standard high resolution (QHD)
+    { name: "QHD", minWidth: 2560, defaultWidth: 1440, jpegQuality: 85, fps: 40, maxFrameSize: 1280 },
+    // Full HD and below
+    { name: "FHD", minWidth: 0, defaultWidth: 1440, jpegQuality: 85, fps: 45, maxFrameSize: 1536 }
+  ];
+
+  // Current resolution profile and adaptive settings
+  private currentProfile: ResolutionProfile;
+  private quality: VNCQualitySettings;
 
   // Frame management
   private processingFrame = false;
@@ -56,19 +78,34 @@ class ScreenCaptureManager {
   private droppedFrames = 0;
   private framesSent = 0;
 
-  // Quality control
-  private readonly MIN_QUALITY = 80;
+  // Memory management
+  private totalMemoryUsed = 0;
+  private readonly MAX_MEMORY_MB = 512; // Maximum memory for frame buffers
+  private memoryPressure = false;
+
+  // Quality control with resolution-aware limits
+  private readonly MIN_QUALITY = 60;  // More aggressive for high-res
   private readonly MAX_QUALITY = 90;
-  private readonly MIN_WIDTH = 1024;
+  private readonly MIN_WIDTH = 800;   // Lower minimum for high-res displays
   private readonly MAX_WIDTH = 1920;
   private readonly PERFORMANCE_CHECK_INTERVAL = 2000; // ms
 
-  private subscribers: Array<(frame: Buffer, dimensions: { width: number; height: number }) => void> = [];
+  // Chunking configuration
+  private readonly CHUNK_SIZE = 32 * 1024; // 32KB chunks
+  private readonly CHUNK_HEADER_SIZE = 100; // JSON header overhead
+
+  private subscribers: Array<(frame: Buffer | { chunks: Buffer[], total: number, dimensions: { width: number; height: number } }, dimensions: { width: number; height: number }) => void> = [];
   private screenSize = robot.getScreenSize();
   private cachedDimensions = this.getScaledDimensions();
 
   private constructor() {
+    this.currentProfile = this.detectResolutionProfile();
+    this.quality = this.initializeQualityFromProfile();
+    this.cachedDimensions = this.getScaledDimensions();
     this.setupPerformanceMonitoring();
+    
+    console.log(`Detected resolution profile: ${this.currentProfile.name} (${this.screenSize.width}x${this.screenSize.height})`);
+    console.log(`Initial settings: width=${this.quality.width}, quality=${this.quality.jpegQuality}, fps=${this.quality.fps}`);
   }
 
   public static getInstance(): ScreenCaptureManager {
@@ -78,6 +115,42 @@ class ScreenCaptureManager {
     return ScreenCaptureManager.instance;
   }
 
+  private detectResolutionProfile(): ResolutionProfile {
+    const { width } = this.screenSize;
+    
+    for (const profile of this.RESOLUTION_PROFILES) {
+      if (width >= profile.minWidth) {
+        return profile;
+      }
+    }
+    
+    // Fallback to lowest profile
+    return this.RESOLUTION_PROFILES[this.RESOLUTION_PROFILES.length - 1];
+  }
+
+  private initializeQualityFromProfile(): VNCQualitySettings {
+    return {
+      width: this.currentProfile.defaultWidth,
+      jpegQuality: this.currentProfile.jpegQuality, 
+      fps: this.currentProfile.fps
+    };
+  }
+
+  private updateMemoryUsage(frameSize: number, isAdd: boolean = true) {
+    if (isAdd) {
+      this.totalMemoryUsed += frameSize;
+    } else {
+      this.totalMemoryUsed = Math.max(0, this.totalMemoryUsed - frameSize);
+    }
+    
+    const memoryMB = this.totalMemoryUsed / (1024 * 1024);
+    this.memoryPressure = memoryMB > this.MAX_MEMORY_MB;
+    
+    if (this.memoryPressure && this.framesSent % 30 === 0) {
+      console.warn(`Memory pressure detected: ${memoryMB.toFixed(1)}MB used`);
+    }
+  }
+
   private setupPerformanceMonitoring() {
     setInterval(() => {
       if (!this.isCapturing) return;
@@ -85,11 +158,13 @@ class ScreenCaptureManager {
       const dropRate = (this.droppedFrames / (this.droppedFrames + this.framesSent)) * 100;
       const avgFrameSize = this.lastFrameSize / 1024;
       const avgProcessingTime = this.getAverageProcessingTime();
+      const memoryMB = this.totalMemoryUsed / (1024 * 1024);
 
       console.debug(
-        `Performance: FPS=${this.framesSent}, Dropped=${this.droppedFrames}, ` +
+        `[${this.currentProfile.name}] Performance: FPS=${this.framesSent}, Dropped=${this.droppedFrames}, ` +
         `Drop Rate=${dropRate.toFixed(1)}%, Size=${avgFrameSize.toFixed(1)}KB, ` +
-        `Processing=${avgProcessingTime.toFixed(1)}ms, Quality=${this.quality.jpegQuality}`
+        `Processing=${avgProcessingTime.toFixed(1)}ms, Quality=${this.quality.jpegQuality}, ` +
+        `Memory=${memoryMB.toFixed(1)}MB${this.memoryPressure ? ' (PRESSURE)' : ''}`
       );
 
       this.droppedFrames = 0;
@@ -98,7 +173,7 @@ class ScreenCaptureManager {
   }
 
   public subscribe(
-    callback: (frame: Buffer, dimensions: { width: number; height: number }) => void
+    callback: (frame: Buffer | { chunks: Buffer[], total: number, dimensions: { width: number; height: number } }, dimensions: { width: number; height: number }) => void
   ): () => void {
     this.subscribers.push(callback);
     if (!this.isCapturing) {
@@ -122,8 +197,13 @@ class ScreenCaptureManager {
       const now = performance.now();
       const timeSinceLastFrame = now - this.lastFrameSentTime;
 
-      // Skip frame if we're processing or it's too soon
-      if (this.processingFrame || timeSinceLastFrame < this.MIN_FRAME_INTERVAL) {
+      // Enhanced frame skipping for high-resolution scenarios
+      const adaptiveMinInterval = this.calculateAdaptiveInterval();
+      
+      // Skip frame if we're processing, it's too soon, or under memory pressure
+      if (this.processingFrame || 
+          timeSinceLastFrame < adaptiveMinInterval ||
+          (this.memoryPressure && timeSinceLastFrame < adaptiveMinInterval * 1.5)) {
         this.droppedFrames++;
         return;
       }
@@ -136,14 +216,39 @@ class ScreenCaptureManager {
       }
 
       // Schedule next capture with dynamic interval
+      const adaptiveInterval = this.calculateAdaptiveInterval();
       const nextInterval = Math.max(
-        this.MIN_FRAME_INTERVAL,
+        adaptiveInterval,
         1000 / this.quality.fps
       );
       setTimeout(captureFrame, nextInterval);
     };
 
     captureFrame();
+  }
+
+  private calculateAdaptiveInterval(): number {
+    let baseInterval = this.MIN_FRAME_INTERVAL;
+    
+    // Increase interval for high resolution displays
+    if (this.screenSize.width >= 3840) { // 4K+
+      baseInterval = Math.max(this.MIN_FRAME_INTERVAL, 50); // ~20fps max for 4K+
+    } else if (this.screenSize.width >= 2560) { // QHD+
+      baseInterval = Math.max(this.MIN_FRAME_INTERVAL, 40); // ~25fps max for QHD+
+    }
+    
+    // Further increase under memory pressure
+    if (this.memoryPressure) {
+      baseInterval *= 1.5;
+    }
+    
+    // Adjust based on processing performance
+    const avgProcessingTime = this.getAverageProcessingTime();
+    if (avgProcessingTime > baseInterval * 0.7) {
+      baseInterval = Math.max(baseInterval, avgProcessingTime * 1.2);
+    }
+    
+    return baseInterval;
   }
 
   private calculateFrameHash(buffer: Buffer): string {
@@ -198,9 +303,25 @@ class ScreenCaptureManager {
       this.framesSent++;
       this.lastFrameSentTime = performance.now();
       this.lastFrameSize = processedFrame.length;
-
-      // Notify subscribers
-      this.subscribers.forEach((cb) => cb(processedFrame, this.cachedDimensions));
+      
+      // Update memory tracking
+      this.updateMemoryUsage(processedFrame.length);
+      
+      // Check if frame needs chunking
+      const frameSizeKB = processedFrame.length / 1024;
+      if (frameSizeKB > this.currentProfile.maxFrameSize) {
+        // Send as chunks
+        const chunkedFrame = this.createChunkedFrame(processedFrame);
+        this.subscribers.forEach((cb) => cb(chunkedFrame, this.cachedDimensions));
+      } else {
+        // Send as single frame
+        this.subscribers.forEach((cb) => cb(processedFrame, this.cachedDimensions));
+      }
+      
+      // Clean up memory tracking after a delay
+      setTimeout(() => {
+        this.updateMemoryUsage(processedFrame.length, false);
+      }, 1000);
     } catch (error) {
       console.error("Frame processing error:", error);
     } finally {
@@ -208,11 +329,30 @@ class ScreenCaptureManager {
 
       // Process any frames that arrived during processing
       if (this.pendingFrames.length > 0) {
+        const adaptiveDelay = Math.min(this.COALESCE_MAX_WAIT, this.calculateAdaptiveInterval());
         this.coalesceTimer = setTimeout(() => {
           this.processCoalescedFrames();
-        }, Math.min(this.COALESCE_MAX_WAIT, this.MIN_FRAME_INTERVAL));
+        }, adaptiveDelay);
       }
     }
+  }
+
+  private createChunkedFrame(frame: Buffer): { chunks: Buffer[], total: number, dimensions: { width: number; height: number } } {
+    const chunks: Buffer[] = [];
+    const totalSize = frame.length;
+    
+    for (let offset = 0; offset < totalSize; offset += this.CHUNK_SIZE) {
+      const end = Math.min(offset + this.CHUNK_SIZE, totalSize);
+      chunks.push(frame.subarray(offset, end));
+    }
+    
+    console.debug(`Chunking large frame: ${(totalSize / 1024).toFixed(1)}KB into ${chunks.length} chunks`);
+    
+    return {
+      chunks,
+      total: chunks.length,
+      dimensions: this.cachedDimensions
+    };
   }
 
   private async processFrame(frame: Buffer): Promise<Buffer> {
@@ -277,29 +417,41 @@ class ScreenCaptureManager {
     if (now - this.lastPerformanceCheck < this.PERFORMANCE_CHECK_INTERVAL) return;
 
     const avgProcessingTime = this.getAverageProcessingTime();
-    const dropRate = this.droppedFrames / (this.droppedFrames + this.framesSent);
+    const dropRate = this.droppedFrames / (this.droppedFrames + this.framesSent + 1);
+    const memoryPressureMultiplier = this.memoryPressure ? 1.5 : 1.0;
 
-    if (dropRate > 0.2 || avgProcessingTime > this.MIN_FRAME_INTERVAL) {
-      // Reduce quality more aggressively when dropping frames
+    // More aggressive quality reduction for high-resolution displays
+    const isHighRes = this.screenSize.width >= 3840; // 4K+
+    const qualityReductionStep = isHighRes ? 8 : 5;
+    const qualityImprovementStep = isHighRes ? 2 : 1;
+    const widthReductionStep = isHighRes ? 192 : 128;
+    const widthImprovementStep = isHighRes ? 64 : 64;
+
+    if (dropRate > 0.15 * memoryPressureMultiplier || 
+        avgProcessingTime > this.calculateAdaptiveInterval() * 0.8 ||
+        this.memoryPressure) {
+      // Reduce quality more aggressively when dropping frames or under memory pressure
       this.quality.jpegQuality = Math.max(
         this.MIN_QUALITY,
-        this.quality.jpegQuality - 5
+        this.quality.jpegQuality - qualityReductionStep
       );
       this.quality.width = Math.max(
         this.MIN_WIDTH,
-        this.quality.width - 128
+        this.quality.width - widthReductionStep
       );
       this.cachedDimensions = this.getScaledDimensions();
+      
+      console.debug(`Quality reduced: width=${this.quality.width}, quality=${this.quality.jpegQuality} (drop rate: ${(dropRate * 100).toFixed(1)}%, memory pressure: ${this.memoryPressure})`);
     } 
-    else if (dropRate < 0.05 && avgProcessingTime < this.MIN_FRAME_INTERVAL * 0.5) {
-      // Gradually improve quality when performance is good
+    else if (dropRate < 0.05 && avgProcessingTime < this.calculateAdaptiveInterval() * 0.5 && !this.memoryPressure) {
+      // Gradually improve quality when performance is good and no memory pressure
       this.quality.jpegQuality = Math.min(
         this.MAX_QUALITY,
-        this.quality.jpegQuality + 1
+        this.quality.jpegQuality + qualityImprovementStep
       );
       this.quality.width = Math.min(
-        this.MAX_WIDTH,
-        this.quality.width + 64
+        this.currentProfile.defaultWidth, // Don't exceed profile default
+        this.quality.width + widthImprovementStep
       );
       this.cachedDimensions = this.getScaledDimensions();
     }
@@ -371,6 +523,16 @@ class ScreenCaptureManager {
 
   public getQualitySettings(): VNCQualitySettings {
     return { ...this.quality };
+  }
+
+  public getResolutionInfo() {
+    return {
+      profile: this.currentProfile.name,
+      screenSize: this.screenSize,
+      currentSettings: this.quality,
+      memoryUsage: (this.totalMemoryUsed / (1024 * 1024)).toFixed(1) + 'MB',
+      memoryPressure: this.memoryPressure
+    };
   }
 }
 
@@ -467,24 +629,37 @@ class VSCodeVNCConnection {
 
   private subscribeToFrameUpdates() {
     const manager = ScreenCaptureManager.getInstance();
-    // Subscribe to frames as they arrive
-    this.unsubscribe = manager.subscribe((frame, dimensions) => {
-      // Convert to Base64
-      const base64Image = frame.toString("base64");
-
-      // Your existing client contract likely expects something like:
-      // {
-      //   type: "screen-update",
-      //   image: "...base64 string...",
-      //   dimensions: { width, height }
-      // }
-      this.ws.send(
-        JSON.stringify({
-          type: "screen-update",
-          image: base64Image,
-          dimensions,
-        })
-      );
+    // Subscribe to frames as they arrive (single frames or chunked)
+    this.unsubscribe = manager.subscribe((frameData, dimensions) => {
+      if (Buffer.isBuffer(frameData)) {
+        // Single frame - convert to Base64
+        const base64Image = frameData.toString("base64");
+        this.ws.send(
+          JSON.stringify({
+            type: "screen-update",
+            image: base64Image,
+            dimensions,
+          })
+        );
+      } else {
+        // Chunked frame
+        const { chunks, total } = frameData;
+        
+        // Send chunks sequentially
+        chunks.forEach((chunk, index) => {
+          const base64Chunk = chunk.toString("base64");
+          this.ws.send(
+            JSON.stringify({
+              type: "screen-update-chunk",
+              chunk: base64Chunk,
+              chunkIndex: index,
+              totalChunks: total,
+              dimensions,
+              isLastChunk: index === total - 1
+            })
+          );
+        });
+      }
     });
   }
 

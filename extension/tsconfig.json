@@ -9,7 +9,7 @@
 		"strict": true,
 		"rootDir": "src",
 		"skipLibCheck": true,
-		"resolveJsonModule": true,
+		"resolveJsonModule": true
 	},
 	"exclude": ["node_modules", ".vscode-test", "./src/scripts", "esbuild.js"],
 }

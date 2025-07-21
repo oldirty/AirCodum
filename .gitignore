@@ -6,3 +6,12 @@ node_modules
 AirCodum
 .DS_Store
 dist
+
+# Test coverage and artifacts
+coverage/
+junit.xml
+eslint-results.json
+
+# Test temporary files
+/tmp/*
+**/*.log

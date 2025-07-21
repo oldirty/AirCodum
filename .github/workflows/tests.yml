@@ -1,0 +1,174 @@
+name: CI/CD Tests
+
+on:
+  push:
+    branches: [ main, develop, 'copilot/**' ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+        cache-dependency-path: extension/package-lock.json
+
+    - name: Install dependencies
+      working-directory: ./extension
+      run: npm ci
+
+    - name: Run TypeScript type checking
+      working-directory: ./extension
+      run: npm run check-types
+
+    - name: Run tests with coverage
+      working-directory: ./extension
+      run: npm run test:ci
+
+    - name: Upload coverage to Codecov
+      if: matrix.node-version == '20.x'
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./extension/coverage/lcov.info
+        directory: ./extension/coverage/
+        flags: unittests
+        name: codecov-umbrella
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results-${{ matrix.node-version }}
+        path: |
+          extension/coverage/
+          extension/junit.xml
+
+  lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+        cache: 'npm'
+        cache-dependency-path: extension/package-lock.json
+
+    - name: Install dependencies
+      working-directory: ./extension
+      run: npm ci
+
+    - name: Run ESLint
+      working-directory: ./extension
+      run: npx eslint src --ext .ts --format=json --output-file=eslint-results.json || true
+
+    - name: Upload lint results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: lint-results
+        path: extension/eslint-results.json
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+        cache: 'npm'
+        cache-dependency-path: extension/package-lock.json
+
+    - name: Install dependencies
+      working-directory: ./extension
+      run: npm ci
+
+    - name: Build extension
+      working-directory: ./extension
+      run: npm run package
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: extension-build
+        path: extension/dist/
+
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+        cache: 'npm'
+        cache-dependency-path: extension/package-lock.json
+
+    - name: Install dependencies
+      working-directory: ./extension
+      run: npm ci
+
+    - name: Run performance tests
+      working-directory: ./extension
+      run: npm test -- --testPathPattern=performance.test.ts --verbose
+
+    - name: Upload performance results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: performance-results
+        path: extension/coverage/
+
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+        cache: 'npm'
+        cache-dependency-path: extension/package-lock.json
+
+    - name: Install dependencies
+      working-directory: ./extension
+      run: npm ci
+
+    - name: Run integration tests
+      working-directory: ./extension
+      run: npm test -- --testPathPattern=integration.test.ts --verbose
+
+    - name: Upload integration test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: integration-results
+        path: extension/coverage/
